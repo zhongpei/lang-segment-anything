@@ -17,7 +17,7 @@ def draw_image(image, masks, boxes, labels, alpha=0.4):
     if len(boxes) > 0:
         image = draw_bounding_boxes(image, boxes, colors=['red'] * len(boxes), labels=labels, width=2)
     if len(masks) > 0:
-        image = draw_segmentation_masks(image, masks=masks, colors=['cyan'] * len(masks), alpha=alpha)
+        image = draw_segmentation_masks(image, masks=masks, colors=['green'] * len(masks), alpha=alpha)
     return image.numpy().transpose(1, 2, 0)
 
 

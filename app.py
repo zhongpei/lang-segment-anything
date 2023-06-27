@@ -15,8 +15,29 @@ from lang_sam.utils import load_image
 warnings.filterwarnings("ignore")
 
 
-class LitGradio(ServeGradio):
+def build_model(sam_type="vit_h"):
+    model = LangSAM(sam_type)
 
+    return model
+
+
+model = build_model(sam_type="vit_h")
+
+
+def predict(sam_type, box_threshold, text_threshold, image_path, text_prompt):
+    print("Predicting... ", sam_type, box_threshold, text_threshold, image_path, text_prompt)
+    if sam_type != model.sam_type:
+        model.build_sam(sam_type)
+    image_pil = load_image(image_path)
+    masks, boxes, phrases, logits = model.predict(image_pil, text_prompt, box_threshold, text_threshold)
+    labels = [f"{phrase} {logit:.2f}" for phrase, logit in zip(phrases, logits)]
+    image_array = np.asarray(image_pil)
+    image = draw_image(image_array, masks, boxes, labels)
+    image = Image.fromarray(np.uint8(image)).convert("RGB")
+    return image
+
+
+with gr.Blocks() as demo:
     inputs = [
         gr.Dropdown(choices=list(SAM_MODELS.keys()), label="SAM model", value="vit_h"),
         gr.Slider(0, 1, value=0.3, label="Box threshold"),
@@ -25,6 +46,8 @@ class LitGradio(ServeGradio):
         gr.Textbox(lines=1, label="Text Prompt"),
     ]
     outputs = [gr.outputs.Image(type="pil", label="Output Image")]
+    btn = gr.Button(label="Run")
+    btn.click(fn=predict, inputs=inputs, outputs=outputs)
 
     examples = [
         [
@@ -50,27 +73,6 @@ class LitGradio(ServeGradio):
         ],
     ]
 
-    def __init__(self, sam_type="vit_h"):
-        super().__init__()
-        self.ready = False
-        self.sam_type = sam_type
+demo.launch(enable_queue=False, share=False, debug=True)
 
-    def predict(self, sam_type, box_threshold, text_threshold, image_path, text_prompt):
-        print("Predicting... ", sam_type, box_threshold, text_threshold, image_path, text_prompt)
-        if sam_type != self.model.sam_type:
-            self.model.build_sam(sam_type)
-        image_pil = load_image(image_path)
-        masks, boxes, phrases, logits = self.model.predict(image_pil, text_prompt, box_threshold, text_threshold)
-        labels = [f"{phrase} {logit:.2f}" for phrase, logit in zip(phrases, logits)]
-        image_array = np.asarray(image_pil)
-        image = draw_image(image_array, masks, boxes, labels)
-        image = Image.fromarray(np.uint8(image)).convert("RGB")
-        return image
-
-    def build_model(self, sam_type="vit_h"):
-        model = LangSAM(sam_type)
-        self.ready = True
-        return model
-
-
-app = L.LightningApp(LitGradio())
+# app = L.LightningApp(LitGradio())
