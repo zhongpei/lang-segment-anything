@@ -11,6 +11,8 @@ from lang_sam.utils import load_image
 import cv2
 import torch
 from diffusers import StableDiffusionInpaintPipeline
+import random
+import string
 
 warnings.filterwarnings("ignore")
 
@@ -32,7 +34,7 @@ def sd_init(sd_ckpt="stabilityai/stable-diffusion-2-inpainting"):
     return pipe
 
 
-sd_pipe = sd_init()
+sd_pipe = None
 sam_model = init_sam(sam_type="vit_h")
 
 
@@ -115,6 +117,10 @@ def sd_erase(ori_input, prompt: str, sam_prompt: str, box_threshold, text_thresh
 
     whole_mask = gen_whole_mask(masks)
 
+    global sd_pipe
+    if sd_pipe is None:
+        sd_pipe = sd_init()
+
     image = sd_inpainting(sd_pipe, ori_input, whole_mask, prompt=prompt)
     return image
 
@@ -129,13 +135,45 @@ def segment_sam(sam_type, box_threshold, text_threshold, image_path, text_prompt
     masks = torch.tensor([])
     if len(boxes) > 0:
         masks = sam_model.predict_sam(image_pil, boxes)
-        masks = masks.squeeze(1)
+        draw_masks = masks.squeeze(1)
 
     labels = [f"{phrase} {logit:.2f}" for phrase, logit in zip(phrases, logits)]
     image_array = np.asarray(image_pil)
-    image = draw_image(image_array, masks, boxes, labels)
+    image = draw_image(image_array, draw_masks, boxes, labels)
     image = Image.fromarray(np.uint8(image)).convert("RGB")
-    return image, masks
+    return image, boxes
+
+
+def crop_sam_image(box_threshold: float, text_threshold: float, image_path, sam_prompt: str, ):
+    output_dir = "output"
+    fn_prefix = f"{sam_prompt.replace(' ', '_')}_{random.randint(0, 1000)}"
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    image_pil = load_image(image_path)
+    all_boxes = []
+    for p in sam_prompt.split("|"):
+        boxes, _, _ = sam_model.predict_dino(image_pil, p, box_threshold, text_threshold)
+        print(f"Boxes: {boxes}")
+        all_boxes.append(boxes)
+        print("Predicting... ", sam_type, box_threshold, text_threshold, image_path, p)
+    boxes = torch.cat(all_boxes, dim=0)
+
+    output_images = []
+    input_image = cv2.imread(image_path)
+    org_height, org_width, _ = input_image.shape
+    img_boxes = boxes.to(torch.int64).tolist()
+    for i in range(len(img_boxes)):
+        x, y, xm, ym = img_boxes[i]
+
+        print(f"Box {i}: {x}  {xm} {y} {ym} ")
+        cropped_image = input_image[y:ym, x:xm]
+
+        filename = os.path.join(output_dir, f"{fn_prefix}-{i}.jpg")
+
+        cv2.imwrite(filename, cropped_image)
+        output_images.append(filename)
+    return output_images
 
 
 with gr.Blocks() as demo:
@@ -143,23 +181,36 @@ with gr.Blocks() as demo:
         sam_type = gr.Dropdown(choices=list(SAM_MODELS.keys()), label="SAM model", value="vit_h")
         sam_box_threshold = gr.Slider(0, 1, value=0.3, label="Box threshold")
         sam_text_threshold = gr.Slider(0, 1, value=0.25, label="Text threshold")
-    input_file = gr.Image(type="filepath", label='Image')
+    with gr.Row():
+        input_file = gr.Image(type="filepath", label='Image')
+
     with gr.Row():
         sam_prompt = gr.Textbox(lines=1, label="Text segment Prompt", value="text")
         sd_prompt = gr.Textbox(lines=1, label="Text erase Prompt", value="No text, clean background")
     with gr.Row():
-        sam_btn = gr.Button(label="Sam Segment", value="sam_segment")
+        sam_btn = gr.Button(label="Sam Segment", value="sam")
+        crop_btn = gr.Button(label="Crop", value="crop")
         erase_btn = gr.Button(label="Erase", value="erase")
 
     with gr.Row():
         mark_image = gr.outputs.Image(type="pil", label="Output Image")
         output_image = gr.outputs.Image(type="pil", label="Output Image")
+        gallery = gr.Gallery(
+            label="Generated images", show_label=False, elem_id="gallery"
+        ).style(object_fit="contain", height="auto")
 
-    masks = gr.State(type="numpy", label="Masks")
+    boxes = gr.State(label="Masks")
+
+    crop_btn.click(
+        fn=crop_sam_image,
+        inputs=[sam_box_threshold, sam_text_threshold, input_file, sam_prompt],
+        outputs=gallery
+    )
+
     sam_btn.click(
         fn=segment_sam,
         inputs=[sam_type, sam_box_threshold, sam_text_threshold, input_file, sam_prompt],
-        outputs=[mark_image, masks]
+        outputs=[mark_image, boxes]
     )
 
     erase_btn.click(
