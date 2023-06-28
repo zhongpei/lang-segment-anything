@@ -1,0 +1,12 @@
+diffusers
+gradio
+git+https://github.com/facebookresearch/segment-anything
+git+https://github.com/IDEA-Research/GroundingDINO
+huggingface_hub
+numpy
+opencv-python
+Pillow
+torch
+torchvision
+transformers
+lightning
