@@ -76,12 +76,14 @@ class LangSAM():
 
     def predict_dino(self, image_pil, text_prompt, box_threshold, text_threshold):
         image_trans = transform_image(image_pil)
-        boxes, logits, phrases = predict(model=self.groundingdino,
-                                         image=image_trans,
-                                         caption=text_prompt,
-                                         box_threshold=box_threshold,
-                                         text_threshold=text_threshold,
-                                         device=self.device)
+        boxes, logits, phrases = predict(
+            model=self.groundingdino,
+            image=image_trans,
+            caption=text_prompt,
+            box_threshold=box_threshold,
+            text_threshold=text_threshold,
+            device=self.device
+        )
         W, H = image_pil.size
         boxes = box_ops.box_cxcywh_to_xyxy(boxes) * torch.Tensor([W, H, W, H])
 
