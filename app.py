@@ -1,3 +1,4 @@
+import json
 import os
 import warnings
 import gradio as gr
@@ -12,15 +13,15 @@ import cv2
 import torch
 from diffusers import StableDiffusionInpaintPipeline
 import random
-import string
+import glob
+import tqdm
+import matplotlib.pyplot as plt
+import io
 
 warnings.filterwarnings("ignore")
 
-
-def init_sam(sam_type="vit_h"):
-    model = LangSAM(sam_type)
-
-    return model
+sd_pipe = None
+sam_model = None
 
 
 def sd_init(sd_ckpt="stabilityai/stable-diffusion-2-inpainting"):
@@ -34,8 +35,49 @@ def sd_init(sd_ckpt="stabilityai/stable-diffusion-2-inpainting"):
     return pipe
 
 
-sd_pipe = None
-sam_model = init_sam(sam_type="vit_h")
+def get_sam_model(sam_type="vit_h"):
+    global sam_model
+    if sam_model is None:
+        sam_model = LangSAM(sam_type)
+    return sam_model
+
+
+def remove_border(input_dir: str, output_dir: str, image_path: str):
+    input_fns = get_images_from_dir(input_dir, image_path)
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    output_fns = []
+    for image_file in tqdm.tqdm(input_fns, total=len(input_fns), desc="remove border"):
+        output_fn = remove_border_one(image_file, output_dir)
+        output_fns.append(output_fn)
+
+    return output_fns
+
+
+def remove_border_one(image_file: str, output_dir: str):
+    image = cv2.imread(image_file)  # 读取图片
+
+    gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    # gray_image = gray_image.astype(np.uint8)
+
+    # 使用自适应阈值计算
+    threshold_image = cv2.adaptiveThreshold(gray_image, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 11, 2)
+
+    # 进行边缘检测
+    # edges = cv2.Canny(threshold_image, 50, 150)
+
+    # 查找轮廓
+    contours, _ = cv2.findContours(threshold_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    max_contour = max(contours, key=cv2.contourArea)
+    x, y, w, h = cv2.boundingRect(max_contour)
+
+    cropped_image = image[y:y + h, x:x + w]
+    output_fn = os.path.join(output_dir, os.path.basename(image_file))
+
+    cv2.imwrite(output_fn, cropped_image)
+    return output_fn
 
 
 def multi_mask2one_mask(masks):
@@ -103,17 +145,44 @@ def sd_inpainting(pipe, ori_input, whole_mask, prompt: str):
     return image
 
 
-def sd_erase(ori_input, prompt: str, sam_prompt: str, box_threshold, text_threshold):
+def sd_erase(
+        input_dir,
+        output_dir,
+        ori_input,
+        prompt: str,
+        sam_prompt: str,
+        box_threshold,
+        text_threshold,
+        box_json,
+        use_sam_box
+):
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    fns = get_images_from_dir(input_dir, ori_input)
+    output_fns = []
+    for image_file in tqdm.tqdm(fns, total=len(fns), desc="sd erase"):
+        image = sd_erase_one(image_file, prompt, sam_prompt, box_threshold, text_threshold, box_json, use_sam_box)
+        output_fn = os.path.join(output_dir, os.path.basename(image_file))
+        image.save(output_fn)
+        output_fns.append(output_fn)
+    return output_fns
+
+
+def sd_erase_one(ori_input, prompt: str, sam_prompt: str, box_threshold, text_threshold, box_json, use_sam_box=False):
     image_pil = load_image(ori_input)
     all_boxes = []
+    if box_json is not None and use_sam_box:
+        all_boxes.append(torch.Tensor(box_json))
     for p in sam_prompt.split("|"):
-        boxes, _, _ = sam_model.predict_dino(image_pil, p, box_threshold, text_threshold)
+        boxes, _, _ = get_sam_model().predict_dino(image_pil, p, box_threshold, text_threshold)
         print(f"Boxes: {boxes}")
         all_boxes.append(boxes)
 
+    print(f"all Boxes: {all_boxes}")
     boxes = torch.cat(all_boxes, dim=0)
-    print(f"all Boxes: {boxes}")
-    masks = sam_model.predict_sam(image_pil, boxes=boxes)
+
+    masks = get_sam_model().predict_sam(image_pil, boxes=boxes)
 
     whole_mask = gen_whole_mask(masks)
 
@@ -127,33 +196,132 @@ def sd_erase(ori_input, prompt: str, sam_prompt: str, box_threshold, text_thresh
 
 def segment_sam(sam_type, box_threshold, text_threshold, image_path, text_prompt):
     print("Predicting... ", sam_type, box_threshold, text_threshold, image_path, text_prompt)
-    if sam_type != sam_model.sam_type:
+    if sam_type != get_sam_model().sam_type:
         sam_model.build_sam(sam_type)
     image_pil = load_image(image_path)
 
-    boxes, logits, phrases = sam_model.predict_dino(image_pil, text_prompt, box_threshold, text_threshold)
-    masks = torch.tensor([])
+    boxes, logits, phrases = get_sam_model().predict_dino(image_pil, text_prompt, box_threshold, text_threshold)
+    draw_masks = torch.tensor([])
+
     if len(boxes) > 0:
-        masks = sam_model.predict_sam(image_pil, boxes)
+        masks = get_sam_model().predict_sam(image_pil, boxes)
         draw_masks = masks.squeeze(1)
 
     labels = [f"{phrase} {logit:.2f}" for phrase, logit in zip(phrases, logits)]
     image_array = np.asarray(image_pil)
     image = draw_image(image_array, draw_masks, boxes, labels)
     image = Image.fromarray(np.uint8(image)).convert("RGB")
-    return image, boxes
+    print(f"{boxes.to(torch.int64).tolist()}")
+
+    return image, boxes.to(torch.int64).tolist()
 
 
-def crop_sam_image(box_threshold: float, text_threshold: float, image_path, sam_prompt: str, ):
-    output_dir = "output"
-    fn_prefix = f"{sam_prompt.replace(' ', '_')}_{random.randint(0, 1000)}"
+def draw_boxes(image_path, box_x, box_y, box_w, box_h, box_json):
+    image_pil = load_image(image_path)
+    image_array = np.asarray(image_pil)
+    draw_masks = torch.tensor([])
+    raw_boxes = [[box_x, box_y, box_x + box_w, box_y + box_h]]
+    if box_json is not None:
+        raw_boxes.extend(box_json)
+
+    boxes = torch.tensor(
+        raw_boxes
+    )
+    labels = [f"{phrase} {logit:.2f}" for phrase, logit in zip(["box", ] * len(raw_boxes), (1.0,) * len(raw_boxes))]
+    image = draw_image(image_array, draw_masks, boxes, labels)
+    image = Image.fromarray(np.uint8(image)).convert("RGB")
+    return image
+
+
+def sd_erase_box(ori_input, prompt, box_x, box_y, box_w, box_h, box_json):
+    image_pil = load_image(ori_input)
+    raw_boxes = [[box_x, box_y, box_x + box_w, box_y + box_h]]
+    if box_json is not None:
+        raw_boxes.extend(box_json)
+    boxes = torch.tensor(raw_boxes)
+    print(f"all Boxes: {boxes}")
+    masks = get_sam_model().predict_sam(image_pil, boxes=boxes)
+    whole_mask = gen_whole_mask(masks)
+
+    global sd_pipe
+    if sd_pipe is None:
+        sd_pipe = sd_init()
+
+    image = sd_inpainting(sd_pipe, ori_input, whole_mask, prompt=prompt)
+    return image
+
+
+def get_images_from_dir(input_dir: str, input_file: str) -> list[str]:
+    input_fns = []
+    if input_dir is not None and os.path.exists(input_dir) and os.path.isdir(input_dir):
+        input_fns.extend(glob.glob(os.path.join(input_dir, "*.jpg")))
+        input_fns.extend(glob.glob(os.path.join(input_dir, "*.png")))
+        input_fns.extend(glob.glob(os.path.join(input_dir, "*.jpeg")))
+
+    if input_file is not None and os.path.exists(input_file) and os.path.isfile(input_file):
+        input_fns.append(input_file)
+
+    print(f"Input files count: {len(input_fns)}")
+    return input_fns
+
+
+def crop_sam_image(
+        input_dir,
+        output_dir: str,
+        box_threshold: float,
+        text_threshold: float,
+        image_path,
+        sam_prompt: str,
+):
+    output_images = []
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
+    input_fns = get_images_from_dir(input_dir, image_path)
+
+    print(f"Input files: {input_fns}")
+    for fn in input_fns:
+        images = crop_sam_image_one(
+            output_dir=output_dir,
+            box_threshold=box_threshold,
+            text_threshold=text_threshold,
+            image_path=fn,
+            sam_prompt=sam_prompt,
+        )
+        output_images.extend(images)
+
+    return output_images
+
+
+def update_image(image_path):
+    image = cv2.imread(image_path)
+    org_height, org_width, _ = image.shape
+
+    plt.imshow(image)
+    # 将图像转换为PIL格式
+    buf = io.BytesIO()  # 创建内存存储区
+    plt.savefig(buf, format='png')  # 将图像保存到内存中
+    buf.seek(0)  # 将文件指针移到开头
+
+    pil_image = Image.open(buf)  # 从内存中读取图像数据
+    image = Image.fromarray(np.uint8(pil_image)).convert("RGB")
+
+    return image
+
+
+def crop_sam_image_one(
+
+        output_dir: str,
+        box_threshold: float,
+        text_threshold: float,
+        image_path,
+        sam_prompt: str,
+):
+    fn_prefix = f"{sam_prompt.replace(' ', '_')}_{random.randint(0, 1000)}"
     image_pil = load_image(image_path)
     all_boxes = []
     for p in sam_prompt.split("|"):
-        boxes, _, _ = sam_model.predict_dino(image_pil, p, box_threshold, text_threshold)
+        boxes, _, _ = get_sam_model().predict_dino(image_pil, p, box_threshold, text_threshold)
         print(f"Boxes: {boxes}")
         all_boxes.append(boxes)
         print("Predicting... ", sam_type, box_threshold, text_threshold, image_path, p)
@@ -176,17 +344,45 @@ def crop_sam_image(box_threshold: float, text_threshold: float, image_path, sam_
     return output_images
 
 
+import json
+
 with gr.Blocks() as demo:
     with gr.Row():
         sam_type = gr.Dropdown(choices=list(SAM_MODELS.keys()), label="SAM model", value="vit_h")
         sam_box_threshold = gr.Slider(0, 1, value=0.3, label="Box threshold")
         sam_text_threshold = gr.Slider(0, 1, value=0.25, label="Text threshold")
+
     with gr.Row():
-        input_file = gr.Image(type="filepath", label='Image')
+        with gr.Column(scale=4):
+            input_file = gr.Image(type="filepath", label='Image')
+        with gr.Column(scale=1):
+            input_dir = gr.Textbox(lines=1, label="Input dir", value="")
+            output_dir = gr.Textbox(lines=1, label="Output dir", value="output")
+            remove_border_btn = gr.Button(label="Remove Border", value="remove_border")
+
+    with gr.Row():
+        with gr.Column(scale=2):
+            box_x = gr.Slider(0, 2000, value=0, label="Box X", step=1)
+            box_y = gr.Slider(0, 2000, value=0, label="Box Y", step=1)
+            box_w = gr.Slider(0, 4000, value=0, label="Box W", step=1)
+            box_h = gr.Slider(0, 4000, value=0, label="Box H", step=1)
+            use_sam_box = gr.Checkbox(label="Use SAM Box", value=True)
+            with gr.Row():
+                draw_box_btn = gr.Button(label="Draw Box", value="draw_box")
+                erase_box_btn = gr.Button(label="Erase Box", value="erase_box")
+
+        with gr.Column(scale=3):
+            with gr.Row():
+                box_text = gr.Textbox(lines=6, label="Box Text", value="")
+                box_json = gr.Json(label="Box JSON", value=None)
+            with gr.Row():
+                text2json_btn = gr.Button(label="Text to JSON", value="text2json")
+                json2text_btn = gr.Button(label="JSON to Text", value="json2text")
 
     with gr.Row():
         sam_prompt = gr.Textbox(lines=1, label="Text segment Prompt", value="text")
         sd_prompt = gr.Textbox(lines=1, label="Text erase Prompt", value="No text, clean background")
+
     with gr.Row():
         sam_btn = gr.Button(label="Sam Segment", value="sam")
         crop_btn = gr.Button(label="Crop", value="crop")
@@ -199,24 +395,63 @@ with gr.Blocks() as demo:
             label="Generated images", show_label=False, elem_id="gallery"
         ).style(object_fit="contain", height="auto")
 
-    boxes = gr.State(label="Masks")
-
+    text2json_btn.click(
+        fn=json.loads,
+        inputs=[box_text],
+        outputs=[box_json],
+    )
+    json2text_btn.click(
+        fn=json.dumps,
+        inputs=[box_json],
+        outputs=[box_text],
+    )
+    input_file.change(
+        fn=update_image,
+        inputs=[input_file],
+        outputs=mark_image,
+    )
+    draw_box_btn.click(
+        fn=draw_boxes,
+        inputs=[input_file, box_x, box_y, box_w, box_h, box_json],
+        outputs=mark_image,
+    )
+    erase_box_btn.click(
+        fn=sd_erase_box,
+        inputs=[input_file, sd_prompt, box_x, box_y, box_w, box_h, box_json],
+        outputs=output_image,
+    )
     crop_btn.click(
         fn=crop_sam_image,
-        inputs=[sam_box_threshold, sam_text_threshold, input_file, sam_prompt],
+        inputs=[input_dir, output_dir, sam_box_threshold, sam_text_threshold, input_file, sam_prompt],
+        outputs=gallery
+    )
+
+    remove_border_btn.click(
+        fn=remove_border,
+        inputs=[input_dir, output_dir, input_file],
         outputs=gallery
     )
 
     sam_btn.click(
         fn=segment_sam,
         inputs=[sam_type, sam_box_threshold, sam_text_threshold, input_file, sam_prompt],
-        outputs=[mark_image, boxes]
+        outputs=[mark_image, box_json]
     )
 
     erase_btn.click(
         fn=sd_erase,
-        inputs=[input_file, sd_prompt, sam_prompt, sam_box_threshold, sam_text_threshold],
-        outputs=[output_image]
+        inputs=[
+            input_dir,
+            output_dir,
+            input_file,
+            sd_prompt,
+            sam_prompt,
+            sam_box_threshold,
+            sam_text_threshold,
+            box_json,
+            use_sam_box
+        ],
+        outputs=gallery
     )
 
 demo.launch(enable_queue=False, share=False, debug=True)
