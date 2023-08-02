@@ -11,7 +11,9 @@ from lang_sam.utils import draw_image
 from lang_sam.utils import load_image
 import cv2
 import torch
+
 from diffusers import StableDiffusionInpaintPipeline
+from diffusers import StableDiffusionXLInpaintPipeline
 import random
 import glob
 import tqdm
@@ -21,15 +23,38 @@ import io
 warnings.filterwarnings("ignore")
 
 sd_pipe = None
+current_sd_model = None
 sam_model = None
 
+SD_MODELS = {
+    "Stable Diffusion 2 Inpainting": "stabilityai/stable-diffusion-2-inpainting",
+    "1.5": "runwayml/stable-diffusion-v1-5",
+    "SDXL": "stabilityai/stable-diffusion-xl-base-1.0",
+}
 
-def sd_init(sd_ckpt="stabilityai/stable-diffusion-2-inpainting"):
+
+def sd_init(sd_ckpt_name="Stable Diffusion 2 Inpainting"):
+    global sd_pipe
+    global current_sd_model
+    global SD_MODELS
+
     # Build Stable Diffusion Inpainting
+    sd_ckpt = SD_MODELS.get(sd_ckpt_name, "stabilityai/stable-diffusion-2-inpainting")
 
-    pipe = StableDiffusionInpaintPipeline.from_pretrained(
-        sd_ckpt, torch_dtype=torch.float16, resume_download=True,
-    )
+    if sd_pipe is not None:
+        if current_sd_model != sd_ckpt:
+            del sd_pipe
+        else:
+            return sd_pipe
+    current_sd_model = sd_ckpt
+    if sd_ckpt_name == "SDXL":
+        pipe = StableDiffusionXLInpaintPipeline.from_pretrained(
+            sd_ckpt, torch_dtype=torch.float16, variant="fp16", resume_download=True, safety_checker=None
+        )
+    else:
+        pipe = StableDiffusionInpaintPipeline.from_pretrained(
+            sd_ckpt, torch_dtype=torch.float16, resume_download=True, safety_checker=None
+        )
     pipe.enable_xformers_memory_efficient_attention()
     pipe = pipe.to('cuda')
     return pipe
@@ -106,7 +131,16 @@ def numpy2PIL(numpy_image):
     return out
 
 
-def sd_inpainting(pipe, ori_input, whole_mask, prompt: str):
+def sd_inpainting(
+        pipe,
+        ori_input,
+        whole_mask,
+        prompt: str,
+        negative_prompt: str = None,
+        steps=50,
+        cfg=7.5,
+        denoise=1
+):
     # Data preparation
     sd_img = Image.open(ori_input).convert("RGB")
     w, h = sd_img.size
@@ -131,12 +165,14 @@ def sd_inpainting(pipe, ori_input, whole_mask, prompt: str):
         prompt = 'No text, clean background'
     image = pipe(
         prompt=prompt,
+        negative_prompt=negative_prompt,
         image=sd_img,
         mask_image=sd_mask_img,
-        num_inference_steps=50,
-        guidance_scale=7.5,
+        num_inference_steps=steps,
+        guidance_scale=cfg,
         height=h_resize,
         width=w_resize,
+        strength=denoise,
     ).images[0]
 
     # Save image
@@ -154,7 +190,9 @@ def sd_erase(
         box_threshold,
         text_threshold,
         box_json,
-        use_sam_box
+        use_sam_box,
+        negative_prompt: str = None,
+        sd_model_name: str = None,
 ):
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
@@ -162,14 +200,34 @@ def sd_erase(
     fns = get_images_from_dir(input_dir, ori_input)
     output_fns = []
     for image_file in tqdm.tqdm(fns, total=len(fns), desc="sd erase"):
-        image = sd_erase_one(image_file, prompt, sam_prompt, box_threshold, text_threshold, box_json, use_sam_box)
+        image = sd_erase_one(
+            image_file,
+            prompt,
+            sam_prompt,
+            box_threshold,
+            text_threshold,
+            box_json,
+            use_sam_box,
+            negative_prompt=negative_prompt,
+            sd_model_name=sd_model_name
+        )
         output_fn = os.path.join(output_dir, os.path.basename(image_file))
         image.save(output_fn)
         output_fns.append(output_fn)
     return output_fns
 
 
-def sd_erase_one(ori_input, prompt: str, sam_prompt: str, box_threshold, text_threshold, box_json, use_sam_box=False):
+def sd_erase_one(
+        ori_input,
+        prompt: str,
+        sam_prompt: str,
+        box_threshold,
+        text_threshold,
+        box_json,
+        use_sam_box=False,
+        negative_prompt=None,
+        sd_model_name=None,
+):
     image_pil = load_image(ori_input)
     all_boxes = []
     if box_json is not None and use_sam_box:
@@ -186,12 +244,32 @@ def sd_erase_one(ori_input, prompt: str, sam_prompt: str, box_threshold, text_th
 
     whole_mask = gen_whole_mask(masks)
 
-    global sd_pipe
-    if sd_pipe is None:
-        sd_pipe = sd_init()
+    sd_pipe = sd_init(sd_model_name)
 
-    image = sd_inpainting(sd_pipe, ori_input, whole_mask, prompt=prompt)
+    image = sd_inpainting(sd_pipe, ori_input, whole_mask, prompt=prompt, negative_prompt=negative_prompt)
     return image
+
+
+def segment_sam(sam_type, box_threshold, text_threshold, image_path, text_prompt):
+    print("Predicting... ", sam_type, box_threshold, text_threshold, image_path, text_prompt)
+    if sam_type != get_sam_model().sam_type:
+        sam_model.build_sam(sam_type)
+    image_pil = load_image(image_path)
+
+    boxes, logits, phrases = get_sam_model().predict_dino(image_pil, text_prompt, box_threshold, text_threshold)
+    draw_masks = torch.tensor([])
+
+    if len(boxes) > 0:
+        masks = get_sam_model().predict_sam(image_pil, boxes)
+        draw_masks = masks.squeeze(1)
+
+    labels = [f"{phrase} {logit:.2f}" for phrase, logit in zip(phrases, logits)]
+    image_array = np.asarray(image_pil)
+    image = draw_image(image_array, draw_masks, boxes, labels)
+    image = Image.fromarray(np.uint8(image)).convert("RGB")
+    print(f"{boxes.to(torch.int64).tolist()}")
+
+    return image, boxes.to(torch.int64).tolist()
 
 
 def segment_sam(sam_type, box_threshold, text_threshold, image_path, text_prompt):
@@ -243,9 +321,7 @@ def sd_erase_box(ori_input, prompt, box_x, box_y, box_w, box_h, box_json):
     masks = get_sam_model().predict_sam(image_pil, boxes=boxes)
     whole_mask = gen_whole_mask(masks)
 
-    global sd_pipe
-    if sd_pipe is None:
-        sd_pipe = sd_init()
+    sd_pipe = sd_init()
 
     image = sd_inpainting(sd_pipe, ori_input, whole_mask, prompt=prompt)
     return image
@@ -351,7 +427,10 @@ with gr.Blocks() as demo:
         sam_type = gr.Dropdown(choices=list(SAM_MODELS.keys()), label="SAM model", value="vit_h")
         sam_box_threshold = gr.Slider(0, 1, value=0.3, label="Box threshold")
         sam_text_threshold = gr.Slider(0, 1, value=0.25, label="Text threshold")
-
+    with gr.Row():
+        sd_model = gr.Dropdown(choices=list(SD_MODELS.keys()), label="SD model", value="Stable Diffusion 2 Inpainting")
+        sd_cfg = gr.Slider(0, 20, value=7.5, label="SD cfg", step=0.1)
+        sd_denoise = gr.Slider(0, 1, value=0.75, label="Denoise", step=0.01)
     with gr.Row():
         with gr.Column(scale=4):
             input_file = gr.Image(type="filepath", label='Image')
@@ -381,7 +460,9 @@ with gr.Blocks() as demo:
 
     with gr.Row():
         sam_prompt = gr.Textbox(lines=1, label="Text segment Prompt", value="text")
-        sd_prompt = gr.Textbox(lines=1, label="Text erase Prompt", value="No text, clean background")
+        with gr.Row():
+            sd_prompt = gr.Textbox(lines=1, label="Text erase Prompt", value="No text, clean background")
+            sd_negative_prompt = gr.Textbox(lines=1, label="Negative Prompt", value="text,watermark")
 
     with gr.Row():
         sam_btn = gr.Button(label="Sam Segment", value="sam")
@@ -449,7 +530,9 @@ with gr.Blocks() as demo:
             sam_box_threshold,
             sam_text_threshold,
             box_json,
-            use_sam_box
+            use_sam_box,
+            sd_negative_prompt,
+            sd_model,
         ],
         outputs=gallery
     )
